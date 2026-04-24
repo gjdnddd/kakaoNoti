@@ -1,9 +1,11 @@
 plugins {
-    id 'com.android.application'
+    id 'com.android.application' version '8.1.0' apply true
 }
 
 android {
+    namespace "com.meritz.notlistener"
     compileSdk 34
+
     defaultConfig {
         applicationId "com.meritz.notlistener"
         minSdk 21
