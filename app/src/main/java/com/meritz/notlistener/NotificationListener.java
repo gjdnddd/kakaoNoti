@@ -7,8 +7,11 @@ import android.service.notification.NotificationListenerService;
 import android.service.notification.StatusBarNotification;
 import android.util.Log;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -22,20 +25,62 @@ public class NotificationListener extends NotificationListenerService {
 
     private static final String TAG = "MeritzListener";
     private static final String KAKAO_PACKAGE = "com.kakao.talk";
-    private static final String GIST_FILENAME = "meritz_trades.json";
+    private static final String TRADES_FILENAME = "meritz_trades.json";
+    private static final String RULES_FILENAME = "parser_rules.json";
+
+    private JSONArray cachedRules = null;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        new Thread(this::loadRules).start();
+    }
+
+    private void loadRules() {
+        SharedPreferences prefs = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
+        String gistToken = prefs.getString("gist_token", "");
+        String gistId = prefs.getString("gist_id", "");
+        if (gistToken.isEmpty() || gistId.isEmpty()) return;
+
+        try {
+            URL url = new URL("https://api.github.com/gists/" + gistId);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("Authorization", "token " + gistToken);
+
+            BufferedReader reader = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) sb.append(line);
+            reader.close();
+            conn.disconnect();
+
+            JSONObject gistData = new JSONObject(sb.toString());
+            JSONObject files = gistData.getJSONObject("files");
+
+            if (files.has(RULES_FILENAME)) {
+                String content = files.getJSONObject(RULES_FILENAME).getString("content");
+                cachedRules = new JSONArray(content);
+                Log.d(TAG, "파싱 규칙 로드 완료: " + cachedRules.length() + "개");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "규칙 파일 로드 실패", e);
+        }
+    }
 
     @Override
     public void onNotificationPosted(StatusBarNotification sbn) {
         if (!KAKAO_PACKAGE.equals(sbn.getPackageName())) return;
 
         SharedPreferences prefs = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
-        String triggerWord = prefs.getString("trigger", "체결");
         String gistToken = prefs.getString("gist_token", "");
         String gistId = prefs.getString("gist_id", "");
+        if (gistToken.isEmpty() || gistId.isEmpty()) return;
 
-        if (gistToken.isEmpty() || gistId.isEmpty()) {
-            Log.w(TAG, "Gist 설정이 없습니다. 앱에서 설정해주세요.");
-            return;
+        if (cachedRules == null) {
+            loadRules();
+            if (cachedRules == null) return;
         }
 
         Notification notification = sbn.getNotification();
@@ -44,52 +89,75 @@ public class NotificationListener extends NotificationListenerService {
         String text = null;
         CharSequence bigText = extras.getCharSequence(Notification.EXTRA_BIG_TEXT);
         CharSequence normalText = extras.getCharSequence(Notification.EXTRA_TEXT);
-
         if (bigText != null) text = bigText.toString();
         else if (normalText != null) text = normalText.toString();
+        if (text == null) return;
 
-        if (text == null || !text.contains(triggerWord)) return;
-
-        Log.d(TAG, "체결 알림 감지: " + text);
-
-        Map<String, String> parsed = parseTradeMessage(text);
-        if (parsed.isEmpty()) return;
-
+        final String finalText = text;
         final String finalToken = gistToken;
         final String finalId = gistId;
-        final Map<String, String> finalParsed = parsed;
-        new Thread(() -> sendToGist(finalParsed, finalToken, finalId)).start();
+
+        try {
+            for (int i = 0; i < cachedRules.length(); i++) {
+                JSONObject rule = cachedRules.getJSONObject(i);
+                String trigger = rule.getString("trigger");
+
+                if (finalText.contains(trigger)) {
+                    Log.d(TAG, "규칙 매칭: " + rule.getString("name"));
+                    Map<String, String> parsed = parseWithRule(finalText, rule);
+                    if (!parsed.isEmpty()) {
+                        parsed.put("증권사", rule.getString("name"));
+                        new Thread(() -> appendToGist(parsed, finalToken, finalId)).start();
+                    }
+                    return;
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "규칙 매칭 실패", e);
+        }
     }
 
-    private Map<String, String> parseTradeMessage(String text) {
+    private Map<String, String> parseWithRule(String text, JSONObject rule) {
         Map<String, String> result = new HashMap<>();
-        extractField(result, text, "계좌명",   "계좌명 : (.+)");
-        extractField(result, text, "계좌번호", "계좌번호 : (.+)");
-        extractField(result, text, "종목명",   "종목명 : (.+)");
-        extractField(result, text, "매매구분", "매매구분 : (.+)");
-        extractField(result, text, "체결단가", "체결단가 : (.+)");
-        extractField(result, text, "주문수량", "주문수량 : (.+)");
-        extractField(result, text, "체결수량", "체결수량 : (.+)");
-        extractField(result, text, "체결금액", "체결금액 : (.+)");
-        extractField(result, text, "체결일자", "체결일자 : (.+)");
-        result.put("timestamp", String.valueOf(System.currentTimeMillis()));
+        try {
+            JSONObject fields = rule.getJSONObject("fields");
+            java.util.Iterator<String> keys = fields.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                String pattern = fields.getString(key);
+                Matcher m = Pattern.compile(pattern).matcher(text);
+                if (m.find()) result.put(key, m.group(1).trim());
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "파싱 실패", e);
+        }
         return result;
     }
 
-    private void extractField(Map<String, String> map, String text, String key, String pattern) {
-        Matcher m = Pattern.compile(pattern).matcher(text);
-        if (m.find()) map.put(key, m.group(1).trim());
-    }
-
-    private void sendToGist(Map<String, String> data, String gistToken, String gistId) {
+    private void appendToGist(Map<String, String> data, String gistToken, String gistId) {
         try {
-            JSONObject trade = new JSONObject(data);
+            long timestamp = System.currentTimeMillis();
+            String id = String.valueOf(timestamp);
+
+            JSONArray existing = fetchExistingArray(gistToken, gistId);
+
+            for (int i = 0; i < existing.length(); i++) {
+                if (id.equals(existing.getJSONObject(i).optString("id"))) {
+                    Log.d(TAG, "중복 id 스킵: " + id);
+                    return;
+                }
+            }
+
+            JSONObject newTrade = new JSONObject(data);
+            newTrade.put("id", id);
+            newTrade.put("timestamp", timestamp);
+            newTrade.put("status", "pending");
+            existing.put(newTrade);
+
             JSONObject fileContent = new JSONObject();
-            fileContent.put("content", trade.toString(2));
-
+            fileContent.put("content", existing.toString(2));
             JSONObject files = new JSONObject();
-            files.put(GIST_FILENAME, fileContent);
-
+            files.put(TRADES_FILENAME, fileContent);
             JSONObject body = new JSONObject();
             body.put("files", files);
 
@@ -99,18 +167,44 @@ public class NotificationListener extends NotificationListenerService {
             conn.setRequestProperty("Authorization", "token " + gistToken);
             conn.setRequestProperty("Content-Type", "application/json");
             conn.setDoOutput(true);
-
             try (OutputStream os = conn.getOutputStream()) {
                 os.write(body.toString().getBytes(StandardCharsets.UTF_8));
             }
 
             int code = conn.getResponseCode();
-            Log.d(TAG, "Gist 전송 결과: " + code);
+            Log.d(TAG, "Gist 저장 결과: " + code);
             conn.disconnect();
 
         } catch (Exception e) {
-            Log.e(TAG, "Gist 전송 실패", e);
+            Log.e(TAG, "Gist 저장 실패", e);
         }
+    }
+
+    private JSONArray fetchExistingArray(String gistToken, String gistId) {
+        try {
+            URL url = new URL("https://api.github.com/gists/" + gistId);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("Authorization", "token " + gistToken);
+
+            BufferedReader reader = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) sb.append(line);
+            reader.close();
+            conn.disconnect();
+
+            JSONObject gistData = new JSONObject(sb.toString());
+            JSONObject files = gistData.getJSONObject("files");
+            if (files.has(TRADES_FILENAME)) {
+                String content = files.getJSONObject(TRADES_FILENAME).getString("content");
+                return new JSONArray(content);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Gist GET 실패", e);
+        }
+        return new JSONArray();
     }
 
     @Override
